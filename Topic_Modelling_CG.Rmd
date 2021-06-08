@@ -1,0 +1,337 @@
+---
+title: "ATELIER TWITTER - 12 MAI 2021"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+editor_options:
+  chunk_output_type: inline
+---
+
+
+
+Load packages :
+```{r}
+require(ggplot2,quietly = T)
+require(scales,quietly = T)
+require(dplyr,quietly = T)
+require(tidytext,quietly = T)
+require(tm,quietly = T)
+require(stringr,quietly = T)
+require(BTM,quietly = T)
+library(udpipe,quietly = T)
+require(rlist,quietly = T)
+require(SnowballC,quietly = T)
+```
+
+### Load the dataset 
+```{r}
+path = ""
+load(file = paste0(path,"datacraft_data_vaccination_5g_2021_05_11.RData"))
+dim(dataset_clean)
+```
+
+
+###Create time series
+```{r}
+
+daily_TS <- data.frame(table(substr(dataset_clean$tweet_date, start = 1,stop = 10)))
+daily_TS$Var1 <- as.Date(daily_TS$Var1)
+colnames(daily_TS) <- c("dates","N")
+p <- ggplot(daily_TS, aes(dates, N)) +
+  geom_bar(stat="identity", na.rm = TRUE)+
+  scale_x_date(labels=date_format ("%b %y"), breaks=date_breaks("1 month")) + theme_minimal()
+print(p)
+
+```
+
+
+### Without retweets 
+```{r}
+
+daily_TS_original <- data.frame(table(substr(dataset_clean$tweet_date[which(!dataset_clean$is_rt)], start = 1,stop = 10)))
+daily_TS_original$Var1 <- as.Date(daily_TS_original$Var1)
+colnames(daily_TS_original) <- c("dates","N")
+p <- ggplot(daily_TS_original, aes( dates, N)) +
+  geom_bar(stat="identity", na.rm = TRUE)+
+  scale_x_date(labels=date_format ("%b %y"), breaks=date_breaks("1 month")) + theme_minimal()
+p
+```
+
+### Stats desc 
+```{r}
+print(length(unique(dataset_clean$pseudo)))  # users uniques 
+print(length(unique(dataset_clean$status_id))) # tweets uniques, RT compris 
+print(length(unique(dataset_clean$pseudo[which(!dataset_clean$is_rt)]))) # Users uniques qui se sont exprimés
+print(length(unique(dataset_clean$status_id[which(!dataset_clean$is_rt)]))) # Tweets uniques sans RT 
+
+```
+
+### Topic modelling avant 10/11/2020
+Application d'un topic model pour avoir une première catégorisation du contenu des messages. 
+
+```{r}
+### Preprocessing 
+dataset_clean_before <- dataset_clean %>% filter(substr(tweet_date, 1, 10)<='2020-11-10')
+
+dataset_clean_for_TM <- dataset_clean_before[!dataset_clean_before$is_rt,]
+dataset_clean_for_TM$tweet_formatted_for_TM <- dataset_clean_for_TM$tweet_formatted
+dataset_clean_for_TM$tweet_formatted_for_TM <- unname(sapply(dataset_clean_for_TM$tweet_formatted_for_TM, function(x) {gsub(x = x, pattern = "(@.*?\\s{1})", replacement = "")}))
+dataset_clean_for_TM$tweet_formatted_for_TM <- sapply(dataset_clean_for_TM$tweet_formatted_for_TM, str_replace_all, pattern = "http.*?\\s|http.*?$", replacement = "")
+
+
+### Tokenization and stopwords deletion 
+clean_stopwords <- function(stopwords){
+  stopwords <- iconv(stopwords, from = 'UTF-8', to='ASCII//TRANSLIT')
+  stopwords <- str_replace_all(stopwords, "[[:punct:]]", "")     
+  return(stopwords)
+}
+basic_stopwords <- clean_stopwords(stopwords(kind = "fr"))
+d <- dataset_clean_for_TM %>%  unnest_tokens(word, tweet_formatted_for_TM) %>% filter(!word %in% basic_stopwords)
+
+###  Add some stopwords 
+additional_stopwords <- c("si","ca","va","ni","etc","via","",'vaccin',"vaccination","vaccins","vacciner","bill","gates",
+                          "contre","etre","fait","tout","tous","vont","faire","non", "plus", "bien", "19", "covid", "covid19", "oui", "aussi", "donc", "alors", "rien", "coronavirus", "quand", "veut", "dit", "sous", 
+"deja", "faut", "peut", "apres", "avoir", "encore", "veulent", "quoi", "ceux", "tres", "bon" ,"depuis", "autres", "vaccines", "puce", 
+"puces", "pucages", "pucer", "pucage", "car", "quoi", "dire", "avant", "jamais", "toujours", "moins", "comment")
+
+additional_stopwords <- clean_stopwords(additional_stopwords)
+d <- d %>% filter(!word %in% additional_stopwords)
+d <- d[which(nchar(d$word)>1),] 
+
+### Lemmatization
+d <- d %>% mutate(word_lemma=wordStem(word, language = "french"))
+d <- d[,c("status_id" ,"word_lemma")]
+
+```
+### Modelling 
+
+Le nombre de topics est fixé arbitrairement à 15 pour gagner du temps. La modélisation est faite via un Gibbs Sampler. 
+```{r}
+
+K_ = 7
+model  <- BTM(d, k = K_, alpha = 1, beta = 0.01, iter = 100, trace = T)
+model
+```
+
+### Extraction des résultats 
+
+Le topic model groupe les tweets en clusters et sort des top terms qui permettent de labelliser ces clusters.
+```{r}
+# Top terms and topic proprtions 
+BTM_terms <- terms(model,top_n = 20)
+BTM_terms <- list.cbind(BTM_terms)[seq(1,(K_*2),2)] # Top terms 
+BTM_predictions <- data.frame(predict(model, newdata = d)) # Topic repartition per tweet
+
+# Associate top topic to each tweet : 
+association_threshold = .25
+number_of_topics_per_message = 1
+topics_per_tweets <- cbind(t(apply(BTM_predictions, 1, function(row, number_of_topics_per_message, 
+                                                 association_threshold) {
+  row_order <- order(row, decreasing = T)
+  row_order.values <- row[row_order]
+  row_order[which(row_order.values < association_threshold)] <- 0
+  row_order.values[which(row_order.values < association_threshold)] <- 0
+  output <- c(row_order[1:number_of_topics_per_message], 
+              row_order.values[1:number_of_topics_per_message])
+  return(output)
+}, number_of_topics_per_message, association_threshold)))
+topics_per_tweets <- as.data.frame(topics_per_tweets)
+colnames(topics_per_tweets) <- c("topic_id","topic_proportion")
+topics_per_tweets$status_id <- rownames(topics_per_tweets)
+rownames(topics_per_tweets) <- NULL
+dataset_clean_for_TM <- merge(dataset_clean_for_TM, topics_per_tweets, by = 'status_id', all.x = T, all.y = F)
+
+# Topics proportions : 
+table(dataset_clean_for_TM$topic_id, useNA = "ifany")
+topics_proportions <- data.frame("topic_id" = c(0, seq(K_),"NA"), 
+                                 "top_terms" = c("No topic",apply(BTM_terms[1:10,], 2, paste, collapse = ", "),"Deleted posts"),
+                                 "N_posts" = as.data.frame(table(dataset_clean_for_TM$topic_id, useNA = "always"))[,2],
+                                 "P_posts" = as.data.frame(table(dataset_clean_for_TM$topic_id, useNA = "always")/nrow(dataset_clean_for_TM)*100)[,2])
+
+```
+
+
+### Sortie des résultats 
+
+```{r}
+# Proportions and top terms 
+print(topics_proportions)
+```
+
+```{r}
+# Sample of posts 
+for (t_ in 1:K_){
+  print(dataset_clean_for_TM[dataset_clean_for_TM$status_id %in% sample(dataset_clean_for_TM[which(dataset_clean_for_TM$topic_id == t_),"status_id"],5), c("status_id","tweet","topic_proportion")])
+}
+```
+
+
+### Topic modelling après 10/11/2020
+Application d'un topic model pour avoir une première catégorisation du contenu des messages. 
+
+```{r}
+
+
+### Preprocessing 
+dataset_clean_after <- dataset_clean %>% filter(substr(tweet_date, 1, 10)>'2020-11-10')
+dataset_clean_for_TM <- dataset_clean_after[!dataset_clean_after$is_rt,]
+dataset_clean_for_TM$tweet_formatted_for_TM <- dataset_clean_for_TM$tweet_formatted
+dataset_clean_for_TM$tweet_formatted_for_TM <- unname(sapply(dataset_clean_for_TM$tweet_formatted_for_TM, function(x) {gsub(x = x, pattern = "(@.*?\\s{1})", replacement = "")}))
+dataset_clean_for_TM$tweet_formatted_for_TM <- sapply(dataset_clean_for_TM$tweet_formatted_for_TM, str_replace_all, pattern = "http.*?\\s|http.*?$", replacement = "")
+
+
+### Tokenization and stopwords deletion 
+clean_stopwords <- function(stopwords){
+  stopwords <- iconv(stopwords, from = 'UTF-8', to='ASCII//TRANSLIT')
+  stopwords <- str_replace_all(stopwords, "[[:punct:]]", "")     
+  return(stopwords)
+}
+basic_stopwords <- clean_stopwords(stopwords(kind = "fr"))
+d <- dataset_clean_for_TM %>%  unnest_tokens(word, tweet_formatted_for_TM) %>% filter(!word %in% basic_stopwords)
+
+###  Add some stopwords 
+additional_stopwords <- c("si","ca","va","ni","etc","via","",'vaccin',"vaccination","vaccins","vacciner","bill","gates",
+                          "contre","etre","fait","tout","tous","vont","faire","non", "plus", "bien", "19", "covid", "covid19", "oui", "aussi", "donc", "alors", "rien", "coronavirus", "quand", "veut", "dit", "sous", 
+"deja", "faut", "peut", "apres", "avoir", "encore", "veulent", "quoi", "ceux", "tres", "bon" ,"depuis", "autres", "vaccines", "puce", 
+"puces", "pucages", "pucer", "pucage", "car", "quoi", "dire", "avant", "jamais", "toujours", "moins", "comment")
+
+additional_stopwords <- clean_stopwords(additional_stopwords)
+d <- d %>% filter(!word %in% additional_stopwords)
+d <- d[which(nchar(d$word)>1),] 
+
+### Lemmatization
+d <- d %>% mutate(word_lemma=wordStem(word, language = "french"))
+d <- d[,c("status_id" ,"word_lemma")]
+
+```
+### Modelling 
+
+Le nombre de topics est fixé arbitrairement à 15 pour gagner du temps. La modélisation est faite via un Gibbs Sampler. 
+```{r}
+
+K_ = 7
+model  <- BTM(d, k = K_, alpha = 1, beta = 0.01, iter = 100, trace = T)
+model
+```
+
+```{r}
+# Top terms and topic proprtions 
+BTM_terms <- terms(model,top_n = 20)
+BTM_terms <- list.cbind(BTM_terms)[seq(1,(K_*2),2)] # Top terms 
+BTM_predictions <- data.frame(predict(model, newdata = d)) # Topic repartition per tweet
+
+# Associate top topic to each tweet : 
+association_threshold = .25
+number_of_topics_per_message = 1
+topics_per_tweets <- cbind(t(apply(BTM_predictions, 1, function(row, number_of_topics_per_message, 
+                                                 association_threshold) {
+  row_order <- order(row, decreasing = T)
+  row_order.values <- row[row_order]
+  row_order[which(row_order.values < association_threshold)] <- 0
+  row_order.values[which(row_order.values < association_threshold)] <- 0
+  output <- c(row_order[1:number_of_topics_per_message], 
+              row_order.values[1:number_of_topics_per_message])
+  return(output)
+}, number_of_topics_per_message, association_threshold)))
+topics_per_tweets <- as.data.frame(topics_per_tweets)
+colnames(topics_per_tweets) <- c("topic_id","topic_proportion")
+topics_per_tweets$status_id <- rownames(topics_per_tweets)
+rownames(topics_per_tweets) <- NULL
+dataset_clean_for_TM <- merge(dataset_clean_for_TM, topics_per_tweets, by = 'status_id', all.x = T, all.y = F)
+
+# Topics proportions : 
+table(dataset_clean_for_TM$topic_id, useNA = "ifany")
+topics_proportions <- data.frame("topic_id" = c(0, seq(K_),"NA"), 
+                                 "top_terms" = c("No topic",apply(BTM_terms[1:10,], 2, paste, collapse = ", "),"Deleted posts"),
+                                 "N_posts" = as.data.frame(table(dataset_clean_for_TM$topic_id, useNA = "always"))[,2],
+                                 "P_posts" = as.data.frame(table(dataset_clean_for_TM$topic_id, useNA = "always")/nrow(dataset_clean_for_TM)*100)[,2])
+
+```
+
+
+### Sortie des résultats 
+
+```{r}
+# Proportions and top terms 
+print(topics_proportions)
+```
+
+```{r}
+# Sample of posts 
+for (t_ in 1:K_){
+  print(dataset_clean_for_TM[dataset_clean_for_TM$status_id %in% sample(dataset_clean_for_TM[which(dataset_clean_for_TM$topic_id == t_),"status_id"],10), c("status_id","tweet","topic_proportion")])
+}
+```
+
+### Topic modelling avec meilleures stop words
+Application d'un topic model pour avoir une première catégorisation du contenu des messages. 
+
+```{r}
+### Preprocessing 
+dataset_clean_before <- dataset_clean %>% filter(substr(tweet_date, 1, 10)<='2020-11-10')
+
+dataset_clean_for_TM <- dataset_clean_before[!dataset_clean_before$is_rt,]
+dataset_clean_for_TM$tweet_formatted_for_TM <- dataset_clean_for_TM$tweet_formatted
+dataset_clean_for_TM$tweet_formatted_for_TM <- unname(sapply(dataset_clean_for_TM$tweet_formatted_for_TM, function(x) {gsub(x = x, pattern = "(@.*?\\s{1})", replacement = "")}))
+dataset_clean_for_TM$tweet_formatted_for_TM <- sapply(dataset_clean_for_TM$tweet_formatted_for_TM, str_replace_all, pattern = "http.*?\\s|http.*?$", replacement = "")
+
+
+### Tokenization and stopwords deletion 
+clean_stopwords <- function(stopwords){
+  stopwords <- iconv(stopwords, from = 'UTF-8', to='ASCII//TRANSLIT')
+  stopwords <- str_replace_all(stopwords, "[[:punct:]]", "")     
+  return(stopwords)
+}
+basic_stopwords <- clean_stopwords(stopwords(kind = "fr"))
+d <- dataset_clean_for_TM %>%  unnest_tokens(word, tweet_formatted_for_TM) %>% filter(!word %in% basic_stopwords)
+
+###  Add some stopwords 
+additional_stopwords <- c("si","ca","va","ni","etc","via","",'vaccin',"vaccination","vaccins","vacciner","bill","gates",
+                          "contre","etre","fait","tout","tous","vont","faire", "the", "to", "and", "plus", "meme",
+                          "comme", "quand", "non", "être", "pourquoi", "rien", "apres")
+additional_stopwords <- clean_stopwords(additional_stopwords)
+d <- d %>% filter(!word %in% additional_stopwords)
+d <- d[which(nchar(d$word)>1),] 
+
+### Lemmatization
+d <- d %>% mutate(word_lemma=wordStem(word, language = "french"))
+d <- d[,c("status_id" ,"word_lemma")]
+
+```
+### Modelling 
+
+Le nombre de topics est fixé arbitrairement à 15 pour gagner du temps. La modélisation est faite via un Gibbs Sampler. 
+```{r}
+
+K_ = 7
+model  <- BTM(d, k = K_, alpha = 1, beta = 0.01, iter = 100, trace = T)
+model
+```
+
+
+```{r}
+# Choosing number of topics
+    model_final=BTM(corpus,15)
+    fit_final <- logLik(model_final)
+    fit_final$ll
+    K_final <- 15
+    for(K in 8:14){
+      print(K,quote =F)
+      model =BTM(corpus,K)
+      print("model done",quote =F)
+      fit <- logLik(model)
+      print("fit done",quote =F)
+      if(fit_final$ll>fit$ll){
+        fit_final <- fit
+        model_final<- model
+        K_final <- K
+      }}
+
+  }
+```
+
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file).
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
